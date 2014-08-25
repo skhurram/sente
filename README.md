@@ -1,7 +1,7 @@
-**[API docs][]** | **[CHANGELOG][]** | [other Clojure libs][] | [Twitter][] | [contact/contributing](#contact--contributing) | current ([semantic][]) version:
+**[API docs][]** | **[CHANGELOG][]** | [other Clojure libs][] | [Twitter][] | [contact/contrib](#contact--contributing) | current [Break Version][]:
 
 ```clojure
-[com.taoensso/sente "0.9.0"] ; < v1.0.0 API is subject to change
+[com.taoensso/sente "0.15.1"] ; Stable
 ```
 
 # Sente, channel sockets for Clojure
@@ -12,8 +12,8 @@
 
 **Sente** is a small client+server library that makes it easy to build **reliable, high-performance realtime web applications with Clojure**.
 
-Or: **We don't need no [Socket.IO][]**  
-Or: **The missing piece in Clojure's web application story**  
+Or: **We don't need no [Socket.IO][]**
+Or: **The missing piece in Clojure's web application story**
 Or: **Clojure(Script) + core.async + WebSockets/Ajax = _The Shiz_**
 
 (I'd also recommend checking out James Henderson's [Chord][] and Kevin Lynagh's [jetty7-websockets-async][] as possible alternatives!)
@@ -25,11 +25,12 @@ Or: **Clojure(Script) + core.async + WebSockets/Ajax = _The Shiz_**
   * Full, **transparent support for [edn][]** over the wire (JSON, XML, and other arbitrary string-encoded formats may be used as edn strings).
   * **Tiny, simple API**: `make-channel-socket!` and you're good to go.
   * Automatic, sensible support for users connected with **multiple clients** and/or devices simultaneously.
+  * Realtime info on **which users are connected** over which protocols (v0.10.0+).
   * **Flexible model**: use it anywhere you'd use WebSockets/Ajax/Socket.IO, etc.
   * Standard **Ring security model**: auth as you like, HTTPS when available, CSRF support, etc.
   * **Fully documented, with examples**.
-  * Small: **~600 lines of code** for the entire client+server implementation.
-  * **Supported servers**: currently only [http-kit][], but easily extended. [PRs welcome](https://github.com/ptaoussanis/sente/issues/2) to add support for additional servers!
+  * Small: **<900 lines of code** for the entire client+server implementation.
+  * **Supported servers**: currently only [http-kit][] but [PRs welcome](https://github.com/ptaoussanis/sente/issues/2) to add support for additional servers!
 
 
 ### Capabilities
@@ -44,10 +45,12 @@ So you can ignore the underlying protocol and deal directly with Sente's unified
 
 ## Getting started
 
+> Note that there's also a full **[reference example project][]** in this repo.
+
 Add the necessary dependency to your [Leiningen][] `project.clj`. This'll provide your project with both the client (ClojureScript) + server (Clojure) side library code:
 
 ```clojure
-[com.taoensso/sente "0.9.0"]
+[com.taoensso/sente "0.15.1"]
 ```
 
 ### On the server (Clojure) side
@@ -70,27 +73,26 @@ For Sente, we're going to add 2 new URLs and setup their handlers:
 (ns my-server-side-routing-ns ; .clj
   (:require
     ;; <other stuff>
-    [clojure.core.match :as match :refer (match)] ; Optional, useful
-    [clojure.core.async :as async :refer (<! <!! >! >!! put! chan go go-loop)]
     [taoensso.sente :as sente] ; <--- Add this
    ))
 
 ;;; Add this: --->
-(let [{:keys [ch-recv send-fn ajax-post-fn ajax-get-or-ws-handshake-fn]}
+(let [{:keys [ch-recv send-fn ajax-post-fn ajax-get-or-ws-handshake-fn
+              connected-uids]}
       (sente/make-channel-socket! {})]
   (def ring-ajax-post                ajax-post-fn)
   (def ring-ajax-get-or-ws-handshake ajax-get-or-ws-handshake-fn)
   (def ch-chsk                       ch-recv) ; ChannelSocket's receive channel
   (def chsk-send!                    send-fn) ; ChannelSocket's send API fn
+  (def connected-uids                connected-uids) ; Watchable, read-only atom
   )
 
 (defroutes my-app
   ;; <other stuff>
 
   ;;; Add these 2 entries: --->
-  (GET  "/chsk" req (#'ring-ajax-get-or-ws-handshake req)) ; Note the #'
-  (POST "/chsk" req (#'ring-ajax-post                req)) ; ''
-
+  (GET  "/chsk" req (ring-ajax-get-or-ws-handshake req))
+  (POST "/chsk" req (ring-ajax-post                req))
   )
 ```
 
@@ -113,13 +115,14 @@ You'll setup something similar on the client side:
   ))
 
 ;;; Add this: --->
-(let [{:keys [chsk ch-recv send-fn]}
+(let [{:keys [chsk ch-recv send-fn state]}
       (sente/make-channel-socket! "/chsk" ; Note the same path as before
        {:type :auto ; e/o #{:auto :ajax :ws}
        })]
   (def chsk       chsk)
   (def ch-chsk    ch-recv) ; ChannelSocket's receive channel
   (def chsk-send! send-fn) ; ChannelSocket's send API fn
+  (def chsk-state state)   ; Watchable, read-only atom
   )
 ```
 
@@ -152,7 +155,7 @@ Term          | Form                                                            
 
   * So clients can use `chsk-send!` to send `event`s to the server. They can optionally request a reply, with timeout.
   * The server can likewise use `chsk-send!` to send `event`s to _all_ the clients (browser tabs, devices, etc.) of a particular connected user by his/her `user-id`.
-  * The server can also use an `event-msg`'s `?reply-fn` to _reply_ to a client `event` using an _arbitrary edn value_.
+  * The server can also use an `event-msg`'s `?reply-fn` to _reply_ to a particular client `event` using an _arbitrary edn value_.
 
 > It's worth noting that the server>user push `(chsk-send! <user-id> <event>)` takes a mandatory **user-id** argument. See the FAQ later for more info.
 
@@ -200,11 +203,17 @@ Sente offers an out-the-box solution by pulling the concept of identity one leve
   * Each user-id may have zero _or more_ connected clients at any given time.
   * Each user-id _may_ survive across clients (browser tabs, devices), and sessions.
 
-**Set the user's `:uid` Ring session key to give him/her an identity**.
+**To give a user an identity, either set the user's `:uid` Ring session key OR supply a `:user-id-fn` (takes request, returns an identity string) to the `make-channel-socket!` constructor.**
 
 If you want a simple _per-session_ identity, generate a _random uuid_. If you want an identity that persists across sessions, try use something with _semantic meaning_ that you may already have like a database-generated user-id, a login email address, a secure URL fragment, etc.
 
 > Note that user-ids are used **only** for server>user push. client>server requests don't take a user-id.
+
+As of Sente v0.13.0+ it's also possible to send events to clients _without_ a user-id (they simply have a `nil` user-id, and you can send to that as you would any other id).
+
+#### How do I integrate Sente with my usual login/auth procedure?
+
+This is trivially easy as of Sente v0.13.0+. Please see the [reference example project][] which now includes a basic login form.
 
 #### Will Sente work with [React][]/[Reagent][]/[Om][]/etc.?
 
@@ -230,18 +239,33 @@ Yup, it's automatic for both Ajax and WebSockets. If the page serving your JavaS
 
 #### Security: CSRF protection?
 
-**This is important**. Sente has support, but you'll need to do a couple things on your end:
-
-  1. Server-side: you'll need to use middleware like `ring-anti-forgery` to generate and check CSRF codes. The `ring-ajax-post` handler should be covered (i.e. protected).
-  2. Client-side: you'll need to pass the page's csrf code to the `make-channel-socket!` constructor.
+**This is important**. Sente has support, but you'll need to use middleware like `ring-anti-forgery` to generate and check CSRF codes. The `ring-ajax-post` handler should be covered (i.e. protected).
 
 The [reference example project][] has a fully-baked example.
+
+#### Pageload: How do I know when Sente is ready client-side?
+
+You'll want to listen on the receive channel for a `[:chsk/state {:first-open? true}]` event. That's the signal that the socket's been established.
 
 #### Examples: wherefore art thou?
 
 There's a full [reference example project][] in the repo. Call `lein start-dev` in that dir to get a (headless) development repl that you can connect to with [Cider][] (emacs) or your IDE.
 
 Further instructions are provided in the relevant namespace.
+
+#### How can server-side channel socket events modify a user's session?
+
+Recall that server-side `event-msg`s are of the form `{:ring-req _ :event _ :?reply-fn _}`, so each server-side event is accompanied by the relevant[*] Ring request.
+
+> * For WebSocket events this is the initial Ring HTTP handshake request, for Ajax events it's just the Ring HTTP Ajax request.
+
+The Ring request's `:session` key is an immutable value, so how do you modify a session in response to an event? You won't be doing this often, but it can be handy (e.g. for login/logout forms).
+
+You've got two choices:
+
+1. Write any changes directly to your Ring SessionStore (i.e. the mutable state that's actually backing your sessions). You'll need the relevant user's session key, which you can find under your Ring request's `:cookies` key. This is flexible, but requires that you know how+where your session data is being stored.
+
+2. Just use regular HTTP Ajax requests for stuff that needs to modify sessions (like login/logout), since these will automatically go through the usual Ring session middleware and let you modify a session with a simple `{:status 200 :session <new-session>}` response. This is the strategy the reference example takes.
 
 #### Any other questions?
 
@@ -265,8 +289,9 @@ Copyright &copy; 2012-2014 Peter Taoussanis. Distributed under the [Eclipse Publ
 [CHANGELOG]: <https://github.com/ptaoussanis/sente/releases>
 [other Clojure libs]: <https://www.taoensso.com/clojure-libraries>
 [Twitter]: <https://twitter.com/ptaoussanis>
-[semantic]: <http://semver.org/>
-[reference example project]: <https://github.com/ptaoussanis/sente/tree/master/reference-example-project>
+[SemVer]: <http://semver.org/>
+[Break Version]: <https://github.com/ptaoussanis/encore/blob/master/BREAK-VERSIONING.md>
+[reference example project]: <https://github.com/ptaoussanis/sente/tree/master/example-project>
 [Leiningen]: <http://leiningen.org/>
 [CDS]: <http://clojure-doc.org/>
 [ClojureWerkz]: <http://clojurewerkz.org/>
